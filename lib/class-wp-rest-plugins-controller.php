@@ -1,12 +1,12 @@
 <?php
 
 /**
- * Manage plugins for a WordPress site
+ * Manage plugins for a WordPress site.
  */
-class WP_REST_Plugins_Controller extends WP_REST_Controller {
+class Zao_REST_Plugins_Controller extends WP_REST_Controller {
 
 	public function __construct() {
-		$this->namespace = 'wp/v2';
+		$this->namespace = 'zao/v1';
 		$this->rest_base = 'plugins';
 	}
 
