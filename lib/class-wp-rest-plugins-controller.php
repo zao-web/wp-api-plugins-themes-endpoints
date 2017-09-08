@@ -677,7 +677,6 @@ class Zao_REST_Plugins_Controller extends WP_REST_Controller {
 
 		$stuff = '';
 		foreach ( $files as $name => $file ) {
-			// $stuff .= '<xmp>'. __LINE__ .') $file: '. print_r( $file, true ) .'</xmp>';
 			// Skip directories (they would be added automatically)
 			if ( $file->isDir() ) {
 				continue;
