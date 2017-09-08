@@ -26,6 +26,11 @@ class Zao_REST_Plugins_Controller extends WP_REST_Controller {
 				'methods'             => WP_REST_Server::READABLE,
 				'callback'            => array( $this, 'get_item' ),
 				'permission_callback' => array( $this, 'get_item_permissions_check' ),
+				'args'                => array(
+					'download_package' => array(
+						'description' => __( 'Adding this query param will initiate the plugin package download.', 'zao-wp-api-plugins' ),
+					),
+				),
 			),
 			array(
 				'methods'             => WP_REST_Server::DELETABLE,
@@ -43,15 +48,22 @@ class Zao_REST_Plugins_Controller extends WP_REST_Controller {
 	 * @return WP_Error|boolean
 	 */
 	public function get_items_permissions_check( $request ) {
-
 		if ( ! current_user_can( 'manage_options' ) ) { // TODO: Something related to plugins. activate_plugin capability seems to not be available for multi-site superadmin (?)
-			return new WP_Error( 'rest_forbidden', __( 'Sorry, you cannot view the list of plugins' ), array( 'status' => rest_authorization_required_code() ) );
+			return new WP_Error( 'rest_forbidden', __( 'Sorry, you cannot view the list of plugins', 'zao-wp-api-plugins' ), array( 'status' => rest_authorization_required_code() ) );
 		}
 
 		return true;
-
 	}
 
+	/**
+	 * Get list of plugins' data.
+	 *
+	 * @since  0.1.0
+	 *
+	 * @param WP_REST_Request $request
+	 *
+	 * @return mixed
+	 */
 	public function get_items( $request ) {
 
 		$data = array();
@@ -88,14 +100,18 @@ class Zao_REST_Plugins_Controller extends WP_REST_Controller {
 		// Split plugins array.
 		$plugins = array_slice( $plugins, $offset, $length );
 
-		foreach ( $plugins as $obj ) {
-			$plugin = $this->prepare_item_for_response( $obj, $request );
+		foreach ( $plugins as $plugin_file => $plugin ) {
+			$plugin['plugin_file'] = $plugin_file;
+			$prepared = $this->prepare_item_for_response( $plugin, $request );
 
-			if ( is_wp_error( $plugin ) ) {
+			if ( is_wp_error( $prepared ) ) {
 				continue;
 			}
 
-			$data[] = $this->prepare_response_for_collection( $plugin );
+			$response = rest_ensure_response( $prepared );
+			$response->add_links( $this->prepare_links( $plugin ) );
+
+			$data[] = $this->prepare_response_for_collection( $response );
 		}
 
 		$response = rest_ensure_response( $data );
@@ -106,6 +122,7 @@ class Zao_REST_Plugins_Controller extends WP_REST_Controller {
 
 		// Add pagination link headers to response.
 		$base = add_query_arg( $request->get_query_params(), rest_url( sprintf( '/%s/%s', $this->namespace, $this->rest_base ) ) );
+
 		if ( $page > 1 ) {
 			$prev_page = $page - 1;
 			if ( $prev_page > $max_pages ) {
@@ -131,23 +148,31 @@ class Zao_REST_Plugins_Controller extends WP_REST_Controller {
 	 * @return WP_Error|boolean
 	 */
 	public function get_item_permissions_check( $request ) {
-
 		if ( ! current_user_can( 'manage_options' ) ) { // TODO: Something related to plugins. activate_plugin capability seems to not be available for multi-site superadmin (?)
-			return new WP_Error( 'rest_forbidden', __( 'Sorry, you do not have access to this resource' ), array( 'status' => rest_authorization_required_code() ) );
+			return new WP_Error( 'rest_forbidden', __( 'Sorry, you do not have access to this resource', 'zao-wp-api-plugins' ), array( 'status' => rest_authorization_required_code() ) );
 		}
 
 		return true;
 
 	}
 
+	/**
+	 * Get the requested plugin's info (or download the package, if 'download_package' param is set).
+	 *
+	 * @since  0.1.0
+	 *
+	 * @param WP_REST_Request $request
+	 *
+	 * @return mixed.
+	 */
 	public function get_item( $request ) {
-		$slug   = $request['slug'];
-		$plugin = null;
+		$slug     = $request['slug'];
+		$plugin   = null;
 
 		require_once ABSPATH . '/wp-admin/includes/plugin.php';
 		$plugins = get_plugins();
 
-		foreach ( $plugins as $active_plugin ) {
+		foreach ( $plugins as $plugin_file => $active_plugin ) {
 			$sanitized_title = sanitize_title( $active_plugin['Name'] );
 			if ( $slug === $sanitized_title ) {
 				$plugin = $active_plugin;
@@ -156,14 +181,20 @@ class Zao_REST_Plugins_Controller extends WP_REST_Controller {
 		}
 
 		if ( ! $plugin ) {
-			return new WP_Error( 'rest_post_invalid_id', __( 'Invalid post id.' ), array( 'status' => 404 ) );
+			return new WP_Error( 'rest_post_invalid_id', __( 'Invalid plugin id.', 'zao-wp-api-plugins' ), array( 'status' => 404 ) );
+		}
+
+		$plugin['plugin_file'] = $plugin_file;
+
+		if ( ! empty( $request['download_package'] ) ) {
+			return self::trigger_package_download( $plugin );
 		}
 
 		$data     = $this->prepare_item_for_response( $plugin, $request );
 		$response = rest_ensure_response( $data );
+		$response->add_links( $this->prepare_links( $plugin, true ) );
 
 		return $response;
-
 	}
 
 	/**
@@ -175,7 +206,7 @@ class Zao_REST_Plugins_Controller extends WP_REST_Controller {
 	public function delete_item_permissions_check( $request ) {
 
 		if ( ! current_user_can( 'delete_plugins' ) ) {
-			return new WP_Error( 'rest_forbidden', __( 'Sorry, you cannot delete this plugin' ), array( 'status' => rest_authorization_required_code() ) );
+			return new WP_Error( 'rest_forbidden', __( 'Sorry, you cannot delete this plugin', 'zao-wp-api-plugins' ), array( 'status' => rest_authorization_required_code() ) );
 		}
 
 		return true;
@@ -192,6 +223,45 @@ class Zao_REST_Plugins_Controller extends WP_REST_Controller {
 
 	}
 
+	/**
+	 * Return an array of contextual links for plugin/plugins.
+	 *
+	 * @since  0.1.0
+	 *
+	 * @param  array $plugin Plugin data.
+	 * @return array         Array of links.
+	 */
+	protected function prepare_links( $plugin, $include_collection = false ) {
+		$links = array(
+			// Standard Link Relations -- http://v2.wp-api.org/extending/linking/
+			'self' => array(
+				'href' => $this->get_plugin_api_uri( $plugin ),
+			),
+			// Enclosure is a proper way to link to the package, but does not show up in the Schema,
+			// so leaving in the plugin response 'package_uri' data.
+			// 'enclosure' => array(
+			// 	'href' => $this->get_package_uri( $plugin ),
+			// 	// TODO: we should provide the "length" attribute: https://tools.ietf.org/html/rfc4287#page-22
+			// 	// 'length' => '',
+			// ),
+		);
+
+		if ( $include_collection ) {
+			$links['collection'] = array(
+				'href' => rest_url( $this->namespace . '/' . $this->rest_base ),
+			);
+		}
+
+		return $links;
+	}
+
+	/**
+	 * Retrieves the plugin item's schema, conforming to JSON Schema.
+	 *
+	 * @since 0.1.0
+	 *
+	 * @return array Plugin item schema data.
+	 */
 	public function get_item_schema() {
 		$schema = array(
 			'$schema'    => 'http://json-schema.org/draft-04/schema#',
@@ -199,61 +269,81 @@ class Zao_REST_Plugins_Controller extends WP_REST_Controller {
 			'type'       => 'object',
 			'properties' => array(
 				'name'        => array(
-					'description' => __( 'The name of the plugin.' ),
+					'description' => __( 'The name of the plugin.', 'zao-wp-api-plugins' ),
 					'type'        => 'string',
 					'readonly'    => true,
 				),
 				'plugin_uri'  => array(
-					'description' => __( 'The uri of the plugin.' ),
+					'description' => __( 'The uri of the plugin.', 'zao-wp-api-plugins' ),
 					'type'        => 'string',
 					'format'      => 'uri',
 					'readonly'    => true,
 				),
 				'version'     => array(
-					'description' => __( 'The plugin version.' ),
+					'description' => __( 'The plugin version.', 'zao-wp-api-plugins' ),
 					'type'        => 'string',
 					'readonly'    => true,
 				),
 				'description' => array(
-					'description' => __( 'A short description of the plugin.' ),
+					'description' => __( 'A short description of the plugin.', 'zao-wp-api-plugins' ),
 					'type'        => 'string',
 					'readonly'    => true,
 				),
 				'author'      => array(
-					'description' => __( 'Name of plugin author.' ),
+					'description' => __( 'Name of plugin author.', 'zao-wp-api-plugins' ),
 					'type'        => 'string',
 					'readonly'    => true,
 				),
 				'author_uri'  => array(
-					'description' => __( 'Plugin author uri.' ),
+					'description' => __( 'Plugin author uri.', 'zao-wp-api-plugins' ),
 					'type'        => 'string',
 					'format'      => 'uri',
 					'readonly'    => true,
 				),
 				'text_domain' => array(
-					'description' => __( 'Plugin text domain.' ),
+					'description' => __( 'Plugin text domain.', 'zao-wp-api-plugins' ),
 					'type'        => 'string',
 					'readonly'    => true,
 				),
 				'domain_path' => array(
-					'description' => __( 'Path for text domain.' ),
+					'description' => __( 'Path for text domain.', 'zao-wp-api-plugins' ),
 					'type'        => 'string',
 					'readonly'    => true,
 				),
 				'network'     => array(
-					'description' => __( 'Whether the plugin is forced to be active on the network via plugin headers. This does not indicate whether the plugin is active on the network.' ),
+					'description' => __( 'Whether the plugin is forced to be active on the network via plugin headers. This does not indicate whether the plugin is active on the network.', 'zao-wp-api-plugins' ),
 					'type'        => 'string',
 					'readonly'    => true,
 				),
 				'title'       => array(
-					'description' => __( 'The title for the resource.' ),
+					'description' => __( 'The title for the resource.', 'zao-wp-api-plugins' ),
 					'type'        => 'string',
 					'readonly'    => true,
 				),
 				// @TODO Possibly delete this from schema as it is somewhat duplicate data.
 				'author_name' => array(
-					'description' => __( 'Name of plugin author.' ),
+					'description' => __( 'Name of plugin author.', 'zao-wp-api-plugins' ),
 					'type'        => 'string',
+					'readonly'    => true,
+				),
+				'status' => array(
+					'description' => __( 'Whether plugin is active on the site or the network.', 'zao-wp-api-plugins' ),
+					'type'        => 'string',
+					'default'     => 'inactive',
+				),
+				'update' => array(
+					'description' => __( 'Whether plugin has an available update.', 'zao-wp-api-plugins' ),
+					'type'        => 'boolean',
+					'default'     => false,
+				),
+				'update_version' => array(
+					'description' => __( 'The version available if plugin has an available update.', 'zao-wp-api-plugins' ),
+					'type'        => 'string',
+				),
+				'package_uri' => array(
+					'description' => __( 'Plugin package download URI.', 'zao-wp-api-plugins' ),
+					'type'        => 'string',
+					'format'      => 'uri',
 					'readonly'    => true,
 				),
 			),
@@ -262,11 +352,18 @@ class Zao_REST_Plugins_Controller extends WP_REST_Controller {
 		return $this->add_additional_fields_schema( $schema );
 	}
 
+	/**
+	 * Retrieves the query params for the plugin collection.
+	 *
+	 * @since 0.1.0
+	 *
+	 * @return array Query parameters for the plugin collection.
+	 */
 	public function get_collection_params() {
 		$params = parent::get_collection_params();
 
 		$params['offset'] = array(
-			'description'        => __( 'Offset the result set by a specific number of items.' ),
+			'description'        => __( 'Offset the result set by a specific number of items.', 'zao-wp-api-plugins' ),
 			'type'               => 'integer',
 			'sanitize_callback'  => 'absint',
 			'validate_callback'  => 'rest_validate_request_arg',
@@ -275,7 +372,15 @@ class Zao_REST_Plugins_Controller extends WP_REST_Controller {
 		return $params;
 	}
 
-
+	/**
+	 * Prepares the plugin for the REST response.
+	 *
+	 * @since 0.1.0
+	 *
+	 * @param mixed           $plugin  Plugin data.
+	 * @param WP_REST_Request $request Request object.
+	 * @return WP_Error|WP_REST_Response Response object on success, or WP_Error object on failure.
+	 */
 	public function prepare_item_for_response( $plugin, $request ) {
 		$data = array();
 
@@ -325,6 +430,340 @@ class Zao_REST_Plugins_Controller extends WP_REST_Controller {
 			$data['author_name'] = $plugin['AuthorName'];
 		}
 
+		if ( isset( $schema['properties']['status'] ) ) {
+			$data['status'] = self::get_status( $plugin['plugin_file'] );
+		}
+
+		$update_info = self::get_update_info( $plugin['plugin_file'] );
+
+		if ( isset( $schema['properties']['update'] ) ) {
+			$data['update'] = (bool) $update_info;
+		}
+
+		if ( isset( $schema['properties']['update_version'] ) ) {
+			$data['update_version'] = $update_info['new_version'];
+		}
+
+		if ( isset( $schema['properties']['package_uri'] ) ) {
+			$data['package_uri'] = $this->get_package_uri( $plugin );
+		}
+
 		return $data;
 	}
+
+	/**
+	 * Get the plugin's status in the network/site.
+	 *
+	 * @since  0.1.0
+	 *
+	 * @param  string  $file The plugin file/id.
+	 *
+	 * @return string        'active-network', 'active', or 'inactive'.
+	 */
+	protected static function get_status( $file ) {
+		if ( is_plugin_active_for_network( $file ) ) {
+			return 'active-network';
+		}
+
+		if ( is_plugin_active( $file ) ) {
+			return 'active';
+		}
+
+		return 'inactive';
+	}
+
+	/**
+	 * Get the URI for single plugin request.
+	 *
+	 * @since  0.1.0
+	 *
+	 * @param  array  $plugin Plugin data.
+	 *
+	 * @return string         The plugin package api URI.
+	 */
+	protected function get_plugin_api_uri( $plugin ) {
+		$api_slug = sanitize_title( $plugin['Name'] );
+		return rest_url( $this->namespace . '/' . $this->rest_base . '/' . $api_slug );
+	}
+
+	/**
+	 * Get the URI for downloading the plugin package.
+	 *
+	 * @since  0.1.0
+	 *
+	 * @param  array  $plugin Plugin data.
+	 *
+	 * @return string         The plugin package download URI.
+	 */
+	protected function get_package_uri( $plugin ) {
+		$url = add_query_arg( 'download_package', 1, $this->get_plugin_api_uri( $plugin ) );
+
+		return apply_filters( 'zao_plugins_download_package_file_url', $url, $plugin, $this );
+	}
+
+	/**
+	 * Check whether a plugin has an update available or not.
+	 *
+	 * @param string $slug The plugin slug.
+	 *
+	 * @return bool
+	 */
+	protected static function has_update( $slug ) {
+		$update_list = get_site_transient( 'update_plugins' );
+
+		return isset( $update_list->response[ $slug ] );
+	}
+
+	/**
+	 * Get the available plugin update info.
+	 *
+	 * @param string $slug The plugin slug
+	 *
+	 * @return array|null
+	 */
+	protected static function get_update_info( $slug ) {
+		$update_list = get_site_transient( 'update_plugins' );
+
+		return isset( $update_list->response[ $slug ] )
+			? (array) $update_list->response[ $slug ]
+			: null;
+	}
+
+	/**
+	 * Check if we can find the WordPress Plugin repo API data for given plugin,
+	 * either from the cached update data, or from the API itself.
+	 *
+	 * @since  0.1.0
+	 *
+	 * @param  string  $slug The slug that would be used in the WordPress plugin repo.
+	 *
+	 * @return string|bool   False if plugin data/url was not found.
+	 */
+	public static function get_plugin_package_url_from_api( $slug ) {
+		// Check plugin update information for package info
+		$package_url = self::check_plugin_update_for_package( $slug );
+
+		if ( ! $package_url ) {
+
+			// Check WP Plugin API for package info
+			$package_url = self::check_plugin_api_for_package( $slug );
+		}
+
+		return $package_url;
+	}
+
+	/**
+	 * Check if we have cached WordPress Plugin repo API package data for given plugin.
+	 *
+	 * @since  0.1.0
+	 *
+	 * @param  string  $slug The slug that would be used in the WordPress plugin repo.
+	 *
+	 * @return string|bool   False if plugin data/url was not found.
+	 */
+	protected static function check_plugin_update_for_package( $slug ) {
+		$update_info = self::get_update_info( $slug );
+		if ( ! empty( $update_info['package'] ) ) {
+			return $update_info['package'];
+		}
+
+		return false;
+	}
+
+	/**
+	 * Check the WordPress Plugin repo API for package data for given plugin.
+	 *
+	 * @since  0.1.0
+	 *
+	 * @param  string  $slug The slug that would be used in the WordPress plugin repo.
+	 *
+	 * @return string|bool   False if plugin data/url was not found.
+	 */
+	protected static function check_plugin_api_for_package( $slug ) {
+		require_once( ABSPATH . 'wp-admin/includes/plugin-install.php' );
+
+		$args = array(
+			'slug' => wp_unslash( dirname( $slug ) ),
+			'is_ssl' => true,
+			'fields' => array(
+				'short_description' => false,
+				'description'       => false,
+				'sections'          => false,
+				'tested'            => false,
+				'requires'          => false,
+				'rating'            => false,
+				'ratings'           => false,
+				'downloaded'        => false,
+				'downloadlink'      => false,
+				'last_updated'      => false,
+				'added'             => false,
+				'tags'              => false,
+				'compatibility'     => false,
+				'homepage'          => false,
+				'versions'          => false,
+				'donate_link'       => false,
+				'reviews'           => false,
+				'banners'           => false,
+				'icons'             => false,
+				'active_installs'   => false,
+				'group'             => false,
+				'contributors'      => false,
+			)
+		);
+		$api = plugins_api( 'plugin_information', $args );
+
+		if ( ! is_wp_error( $api ) && ! empty( $api->download_link ) ) {
+			return $api->download_link;
+		}
+
+		return false;
+	}
+
+	/**
+	 * If requesting the download_package API url, then trigger the package download.
+	 *
+	 * @since  0.1.0
+	 *
+	 * @param  array  $plugin Plugin data.
+	 *
+	 * @return void|WP_Error  Error if plugin package could not be downloaded.
+	 */
+	protected static function trigger_package_download( $plugin ) {
+		$slug = $plugin['plugin_file'];
+
+		$package_url = self::get_plugin_package_url_from_api( $slug );
+
+		if ( $package_url ) {
+			wp_redirect( esc_url_raw( $package_url ) );
+			exit;
+		}
+
+		// Create package Zip file on the fly, download, and then delete it.
+		$package_url = self::generate_download( $plugin );
+
+		if ( ! $package_url ) {
+			return new WP_Error( 'rest_plugin_package_download_error', sprintf( __( 'Sorry, plugin package for "%s" cannot be downloaded.', 'zao-wp-api-plugins' ), $plugin['Name'] ), array( 'status' => 500 ) );
+		}
+	}
+
+	/**
+	 * Generates a zip package and downloads it.
+	 *
+	 * @since  0.1.0
+	 *
+	 * @param  array  $plugin Plugin data.
+	 *
+	 * @return void|bool      False if plugin path does not exist.
+	 */
+	protected static function generate_download( $plugin ) {
+		$plugin_dir_name = dirname( $plugin['plugin_file'] );
+		$path            = trailingslashit( trailingslashit( WP_PLUGIN_DIR ) . $plugin_dir_name );
+
+		if ( ! file_exists( $path ) ) {
+			return false;
+		}
+
+		// Initialize archive objectZ
+		$zip = new ZipArchive();
+		// Creates new zip archive
+		if ( true !== $zip->open( $plugin_dir_name, ZIPARCHIVE::CREATE ) ) {
+			exit( sprintf( __( "Cannot open <%s>\n", 'zao-wp-api-plugins' ), $filename ) );
+		}
+
+		// Create recursive directory iterator
+		$files = new RecursiveIteratorIterator(
+			new RecursiveDirectoryIterator( $path )
+		);
+
+		$stuff = '';
+		foreach ( $files as $name => $file ) {
+			// $stuff .= '<xmp>'. __LINE__ .') $file: '. print_r( $file, true ) .'</xmp>';
+			// Skip directories (they would be added automatically)
+			if ( $file->isDir() ) {
+				continue;
+			}
+
+			// Do not include certain blacklisted directories and files.
+			if ( self::is_blacklisted( $file, $path ) ) {
+				continue;
+			}
+
+			$file_path = $file->getRealPath();
+			$relative_path = trailingslashit( $plugin_dir_name ) . substr( $file_path, strlen( $path ) );
+
+			$zip->addFile( $file_path, $relative_path );
+		}
+
+		$zip->close();
+
+		$zip_file_name = sanitize_file_name( $plugin['Name'] . ' ' . $plugin['Version'] ) . '.zip';
+		self::download_temp_file( $plugin_dir_name, $zip_file_name );
+	}
+
+	/**
+	 * Determine if a file is blacklisted from being included in the zip package.
+	 *
+	 * @since  0.1.0
+	 *
+	 * @param  SplFileInfo $file File handle object.
+	 * @param  string      $path The plugin's path.
+	 *
+	 * @return boolean           Whether file is blacklisted from being included in zip package.
+	 */
+	protected static function is_blacklisted( SplFileInfo $file, $path ) {
+		$is_blacklisted = false;
+		$dir_blacklist = apply_filters( 'zao_plugins_download_package_directory_blacklist', array(
+			'.git/',
+			'node_modules/',
+		) );
+
+		$file_blacklist = apply_filters( 'zao_plugins_download_package_file_blacklist', array(
+			'.gitattributes' => 1,
+			'.gitignore' => 1,
+		) );
+
+		$path = trailingslashit( ltrim( str_replace( $path, '', $file->getPath() ), '/' ) );
+		foreach ( $dir_blacklist as $blacklisted ) {
+			if ( false !== strpos( $path, $blacklisted ) ) {
+				$is_blacklisted = true;
+				break;
+			}
+		}
+
+		if ( isset( $file_blacklist[ $file->getFilename() ] ) ) {
+			$is_blacklisted = true;
+		}
+
+		return apply_filters( 'zao_plugins_download_file_is_blacklisted', $is_blacklisted, $file, $path );
+	}
+
+	/**
+	 * Downloads file specified and then deletes it.
+	 *
+	 * @since  0.1.0
+	 *
+	 * @param  string  $file     File path.
+	 * @param  string  $filename Downloaded file name.
+	 *
+	 * @return void
+	 */
+	protected static function download_temp_file( $file, $filename = '' ) {
+		if ( empty( $filename ) ) {
+			$filename = basename( $file );
+		}
+		header( 'Content-Description: File Transfer' );
+		header( 'Content-Type: application/octet-stream' );
+		header( 'Content-Disposition: attachment; filename=' . $filename );
+		header( 'Content-Transfer-Encoding: binary' );
+		header( 'Expires: 0' );
+		header( 'Cache-Control: must-revalidate, post-check=0, pre-check=0' );
+		header( 'Pragma: public' );
+		header( 'Content-Length: ' . filesize( $file ) );
+		ob_clean();
+		flush();
+		readfile( $file );
+		unlink( $file );
+		exit;
+	}
+
 }
